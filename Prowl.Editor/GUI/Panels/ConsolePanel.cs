@@ -78,6 +78,7 @@ public class ConsolePanel : DockPanel
     private int _lastFilterHash;
     private bool _lastCollapseState;
     private readonly List<int> _filteredIndices = [];
+    private readonly List<int> _filteredCounts = [];
     private int _selectedFilteredIndex = -1;
     private TextLayout? _ellipsis;
 
@@ -214,16 +215,15 @@ public class ConsolePanel : DockPanel
 
         if (_messages.Count > 0)
         {
-            int index = _messages.FindIndex(x => x.FullMessage == message && x.Severity == severity && string.Equals(x.StackTrace.ToString(), stackTrace?.ToString(), StringComparison.Ordinal));
-            if (index != -1)
+            LogEntry last = _messages[^1];
+            if (last.FullMessage == message && last.Severity == severity && string.Equals(last.StackTrace?.ToString(), stackTrace?.ToString(), StringComparison.Ordinal))
             {
-                var sameMessage = _messages[index];
-                sameMessage.Count += 1;
-                sameMessage.TimeString = time.ToString("HH:mm:ss");
-                sameMessage.StackTrace = stackTrace ?? sameMessage.StackTrace;
-                sameMessage.TimeLayout = null;
-                sameMessage.CountLayout = null;
-                _messages[index] = sameMessage;
+                last.Count += 1;
+                last.TimeString = time.ToString("HH:mm:ss");
+                last.StackTrace = stackTrace ?? last.StackTrace;
+                last.TimeLayout = null;
+                last.CountLayout = null;
+                _messages[^1] = last;
                 return;
             }
         }
@@ -347,7 +347,7 @@ public class ConsolePanel : DockPanel
     // visible slice, drawing cached TextLayouts straight to the canvas so 500 messages stay cheap.
     private void DrawMessages(Paper paper, FontFile font, float width, float height)
     {
-        int filterHash = HashCode.Combine(_showInfo, _showWarnings, _showErrors, _searchText);
+        int filterHash = HashCode.Combine(_showInfo, _showWarnings, _showErrors, _searchText, _messages.Count > 0 ? _messages[^1].Count : 0);
         if (_lastMessageCount != _messages.Count || _lastFilterHash != filterHash || _lastCollapseState != _collapse)
         {
             _lastMessageCount = _messages.Count;
@@ -556,9 +556,10 @@ public class ConsolePanel : DockPanel
                 rightCursor -= sw + gap;
             }
 
-            if (_collapse && msg.Count > 1)
+            int count = _collapse ? _filteredCounts[vi] : msg.Count;
+            if (_collapse && count > 1)
             {
-                msg.CountLayout ??= Make(msg.Count.ToString(), bold, textSize);
+                msg.CountLayout ??= Make(count.ToString(), bold, textSize);
                 float cw = LW(msg.CountLayout), badgeW = cw + 12f, badgeH = 16f;
                 float badgeX = rightCursor - badgeW, badgeY = line1 - badgeH * 0.5f;
                 canvas.RoundedRectFilled(badgeX, badgeY, badgeW, badgeH, EditorTheme.Roundness > 0f ? badgeH * 0.5f : 0f, EditorTheme.Neutral400);
@@ -607,19 +608,38 @@ public class ConsolePanel : DockPanel
     private void RebuildFilteredList()
     {
         _filteredIndices.Clear();
-        for (int i = _messages.Count - 1; i >= 0; i--)
+        _filteredCounts.Clear();
+        Dictionary<(LogSeverity, string, string?), int>? seen = _collapse ? new() : null;
+        for (int i = 0; i < _messages.Count; i++)
         {
             LogEntry msg = _messages[i];
             if (!ShouldShow(msg.Severity)) continue;
             if (!EditorUtils.MatchesSearch(msg.Message, _searchText))
                 continue;
 
-            if (_collapse || msg.Count == 1)
+            if (seen != null)
+            {
+                var key = (msg.Severity, msg.FullMessage, msg.StackTrace?.ToString());
+                if (seen.TryGetValue(key, out int idx))
+                {
+                    _filteredIndices[idx] = i;
+                    _filteredCounts[idx] += msg.Count;
+                    _messages[i] = msg with { CountLayout = null };
+                    continue;
+                }
+                seen[key] = _filteredIndices.Count;
+                _messages[i] = msg with { CountLayout = null };
                 _filteredIndices.Add(i);
+                _filteredCounts.Add(msg.Count);
+            }
             else
+            {
                 for (int t = 0; t < msg.Count; t++)
                     _filteredIndices.Add(i);
+            }
         }
+        _filteredIndices.Reverse();
+        _filteredCounts.Reverse();
         if (_selectedFilteredIndex >= _filteredIndices.Count)
             _selectedFilteredIndex = -1;
     }
