@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -55,6 +55,7 @@ public class ConsolePanel : DockPanel
 
     private static readonly List<LogEntry> _messages = [];
     private static bool _subscribed;
+    private static int s_messageVersion;
 
     // Every log waits here until a reader drains it into _messages, so logging from any thread never touches the list.
     private static readonly ConcurrentQueue<(string Message, DebugStackTrace? StackTrace, LogSeverity Severity, DateTime Time)> s_pending = new();
@@ -74,10 +75,11 @@ public class ConsolePanel : DockPanel
     // Cached filtered list (rebuilt when messages or filters change). Per-instance: each Console
     // tab has its own filter settings/selection, so the cache derived from them must be per-instance
     // too - a shared static cache lets two open tabs stomp each other's filtered view and selection.
-    private int _lastMessageCount;
+    private int _lastMessageVersion;
     private int _lastFilterHash;
     private bool _lastCollapseState;
     private readonly List<int> _filteredIndices = [];
+    private readonly List<int> _filteredCounts = [];
     private int _selectedFilteredIndex = -1;
     private TextLayout? _ellipsis;
 
@@ -110,7 +112,11 @@ public class ConsolePanel : DockPanel
     /// <summary>Removes every log shown in the Console.</summary>
     public static void Clear()
     {
-        lock (s_messagesLock) _messages.Clear();
+        lock (s_messagesLock)
+        {
+            _messages.Clear();
+            s_messageVersion++;
+        }
     }
 
     // Helper class to redirect Console.WriteLine and Console.Error.WriteLine to the console panel.
@@ -208,22 +214,37 @@ public class ConsolePanel : DockPanel
             Append(log.Message, log.StackTrace, log.Severity, log.Time);
     }
 
+    private static bool SameStackTrace(DebugStackTrace? a, DebugStackTrace? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        int aCount = a?.StackFrames?.Length ?? 0;
+        int bCount = b?.StackFrames?.Length ?? 0;
+        if (aCount != bCount) return false;
+        if (aCount == 0) return true;
+        for (int i = 0; i < aCount; i++)
+        {
+            if (a!.StackFrames[i] != b!.StackFrames[i])
+                return false;
+        }
+        return true;
+    }
+
     private static void Append(string message, DebugStackTrace? stackTrace, LogSeverity severity, DateTime time)
     {
+        s_messageVersion++;
         string firstLine = message.Contains('\n') ? message.Split('\n')[0] : message;
 
         if (_messages.Count > 0)
         {
-            int index = _messages.FindIndex(x => x.FullMessage == message && x.Severity == severity && string.Equals(x.StackTrace.ToString(), stackTrace?.ToString(), StringComparison.Ordinal));
-            if (index != -1)
+            LogEntry last = _messages[^1];
+            if (last.FullMessage == message && last.Severity == severity && SameStackTrace(last.StackTrace, stackTrace))
             {
-                var sameMessage = _messages[index];
-                sameMessage.Count += 1;
-                sameMessage.TimeString = time.ToString("HH:mm:ss");
-                sameMessage.StackTrace = stackTrace ?? sameMessage.StackTrace;
-                sameMessage.TimeLayout = null;
-                sameMessage.CountLayout = null;
-                _messages[index] = sameMessage;
+                last.Count += 1;
+                last.TimeString = time.ToString("HH:mm:ss");
+                last.StackTrace = stackTrace ?? last.StackTrace;
+                last.TimeLayout = null;
+                last.CountLayout = null;
+                _messages[^1] = last;
                 return;
             }
         }
@@ -292,7 +313,7 @@ public class ConsolePanel : DockPanel
                 LevelChip(paper, font, "con_copy", EditorIcons.Copy_I, EditorTheme.InkDim, Loc.Get("console.copy"), null, false, !hasSelection,
                     () => { if (SelectedEntry() is { } entry) paper.SetClipboard(CopyText(entry, withStack: true)); });
 
-                ToolbarIconBtn(paper, "con_clear", EditorIcons.Trash, Loc.Get("console.clear"), false, () => { Clear(); _filteredIndices.Clear(); _selectedFilteredIndex = -1; });
+                ToolbarIconBtn(paper, "con_clear", EditorIcons.Trash, Loc.Get("console.clear"), false, () => { Clear(); _filteredIndices.Clear(); _filteredCounts.Clear(); _selectedFilteredIndex = -1; });
                 ToolbarIconBtn(paper, "con_opts", EditorIcons.EllipsisVertical, Loc.Get("console.options"), false,
                     () => Origami.ContextMenu((float)paper.PointerPos.X, (float)paper.PointerPos.Y, BuildOptionsMenu));
             }
@@ -348,9 +369,9 @@ public class ConsolePanel : DockPanel
     private void DrawMessages(Paper paper, FontFile font, float width, float height)
     {
         int filterHash = HashCode.Combine(_showInfo, _showWarnings, _showErrors, _searchText);
-        if (_lastMessageCount != _messages.Count || _lastFilterHash != filterHash || _lastCollapseState != _collapse)
+        if (_lastMessageVersion != s_messageVersion || _lastFilterHash != filterHash || _lastCollapseState != _collapse)
         {
-            _lastMessageCount = _messages.Count;
+            _lastMessageVersion = s_messageVersion;
             _lastFilterHash = filterHash;
             _lastCollapseState = _collapse;
             RebuildFilteredList();
@@ -403,7 +424,8 @@ public class ConsolePanel : DockPanel
     {
         if (row < 0 || row >= _filteredIndices.Count) return false;
         _selectedFilteredIndex = row;
-        Selection.Select(new ConsoleLogSelection(_messages[_filteredIndices[row]]));
+        int count = _collapse && row < _filteredCounts.Count ? _filteredCounts[row] : 1;
+        Selection.Select(new ConsoleLogSelection(_messages[_filteredIndices[row]], count));
         return true;
     }
 
@@ -556,13 +578,17 @@ public class ConsolePanel : DockPanel
                 rightCursor -= sw + gap;
             }
 
-            if (_collapse && msg.Count > 1)
+            int displayCount = _collapse && vi < _filteredCounts.Count ? _filteredCounts[vi] : msg.Count;
+            if (_collapse && displayCount > 1)
             {
-                msg.CountLayout ??= Make(msg.Count.ToString(), bold, textSize);
-                float cw = LW(msg.CountLayout), badgeW = cw + 12f, badgeH = 16f;
+                TextLayout countLayout = (displayCount == msg.Count && msg.CountLayout != null)
+                    ? msg.CountLayout
+                    : Make(displayCount.ToString(), bold, textSize);
+                if (displayCount == msg.Count) msg.CountLayout = countLayout;
+                float cw = LW(countLayout), badgeW = cw + 12f, badgeH = 16f;
                 float badgeX = rightCursor - badgeW, badgeY = line1 - badgeH * 0.5f;
                 canvas.RoundedRectFilled(badgeX, badgeY, badgeW, badgeH, EditorTheme.Roundness > 0f ? badgeH * 0.5f : 0f, EditorTheme.Neutral400);
-                canvas.DrawLayout(msg.CountLayout, badgeX + (badgeW - cw) * 0.5f, line1 - LH(msg.CountLayout) * 0.5f, EditorTheme.Ink300);
+                canvas.DrawLayout(countLayout, badgeX + (badgeW - cw) * 0.5f, line1 - LH(countLayout) * 0.5f, EditorTheme.Ink300);
                 rightCursor -= badgeW + gap;
             }
 
@@ -604,22 +630,67 @@ public class ConsolePanel : DockPanel
         _ => (EditorIcons.CircleInfo_I, EditorTheme.Blue400, "info"),
     };
 
+    private readonly struct MessageKey(LogSeverity severity, string message, DebugStackTrace? stackTrace) : IEquatable<MessageKey>
+    {
+        public readonly LogSeverity Severity = severity;
+        public readonly string Message = message;
+        public readonly DebugStackTrace? StackTrace = stackTrace;
+
+        public bool Equals(MessageKey other) =>
+            Severity == other.Severity &&
+            string.Equals(Message, other.Message, StringComparison.Ordinal) &&
+            SameStackTrace(StackTrace, other.StackTrace);
+
+        public override bool Equals(object? obj) => obj is MessageKey other && Equals(other);
+
+        public override int GetHashCode() => HashCode.Combine(Severity, Message);
+    }
+
     private void RebuildFilteredList()
     {
         _filteredIndices.Clear();
-        for (int i = _messages.Count - 1; i >= 0; i--)
-        {
-            LogEntry msg = _messages[i];
-            if (!ShouldShow(msg.Severity)) continue;
-            if (!EditorUtils.MatchesSearch(msg.Message, _searchText))
-                continue;
+        _filteredCounts.Clear();
 
-            if (_collapse || msg.Count == 1)
-                _filteredIndices.Add(i);
-            else
+        if (!_collapse)
+        {
+            for (int i = _messages.Count - 1; i >= 0; i--)
+            {
+                LogEntry msg = _messages[i];
+                if (!ShouldShow(msg.Severity)) continue;
+                if (!EditorUtils.MatchesSearch(msg.Message, _searchText))
+                    continue;
+
                 for (int t = 0; t < msg.Count; t++)
+                {
                     _filteredIndices.Add(i);
+                    _filteredCounts.Add(1);
+                }
+            }
         }
+        else
+        {
+            Dictionary<MessageKey, int> seen = new();
+            for (int i = _messages.Count - 1; i >= 0; i--)
+            {
+                LogEntry msg = _messages[i];
+                if (!ShouldShow(msg.Severity)) continue;
+                if (!EditorUtils.MatchesSearch(msg.Message, _searchText))
+                    continue;
+
+                var key = new MessageKey(msg.Severity, msg.FullMessage, msg.StackTrace);
+                if (seen.TryGetValue(key, out int filteredIdx))
+                {
+                    _filteredCounts[filteredIdx] += msg.Count;
+                }
+                else
+                {
+                    seen[key] = _filteredIndices.Count;
+                    _filteredIndices.Add(i);
+                    _filteredCounts.Add(msg.Count);
+                }
+            }
+        }
+
         if (_selectedFilteredIndex >= _filteredIndices.Count)
             _selectedFilteredIndex = -1;
     }
@@ -631,6 +702,16 @@ public class ConsolePanel : DockPanel
         LogSeverity.Error or LogSeverity.Exception => _showErrors,
         _ => true,
     };
+
+    internal IReadOnlyList<int> FilteredIndices => _filteredIndices;
+    internal IReadOnlyList<int> FilteredCounts => _filteredCounts;
+    internal bool Collapse { get => _collapse; set => _collapse = value; }
+    internal void UpdateFilteredListForTesting()
+    {
+        lock (s_messagesLock) DrainPending();
+        RebuildFilteredList();
+    }
+    internal static IReadOnlyList<LogEntry> Messages => _messages;
 }
 
 /// <summary>Wrapper for a console log entry so it can be selected and shown in the inspector.</summary>
@@ -642,12 +723,12 @@ public class ConsoleLogSelection
     public int Count { get; }
     public DebugStackTrace? StackTrace { get; }
 
-    internal ConsoleLogSelection(ConsolePanel.LogEntry entry)
+    internal ConsoleLogSelection(ConsolePanel.LogEntry entry, int count = -1)
     {
         Message = entry.FullMessage;
         Severity = entry.Severity;
         Time = entry.TimeString;
-        Count = entry.Count;
+        Count = count >= 0 ? count : entry.Count;
         StackTrace = entry.StackTrace;
     }
 }
